@@ -64,15 +64,23 @@ def train_and_evaluate(num_steps=1000):
         def __rtruediv__(self, other): return other * self**-1
 
         def backward(self):
+            # Iterative topological sort to avoid deep recursion on large graphs
             topo = []
             visited = set()
-            def build_topo(v):
-                if v not in visited:
-                    visited.add(v)
-                    for child in v._children:
-                        build_topo(child)
-                    topo.append(v)
-            build_topo(self)
+            seen = set()
+            stack = [self]
+            while stack:
+                v = stack.pop()
+                if v in seen:
+                    if v not in visited:
+                        visited.add(v)
+                        topo.append(v)
+                    continue
+                seen.add(v)
+                stack.append(v)  # add again to process after children
+                for child in v._children:
+                    if child not in seen:
+                        stack.append(child)
             self.grad = 1
             for v in reversed(topo):
                 for child, local_grad in zip(v._children, v._local_grads):

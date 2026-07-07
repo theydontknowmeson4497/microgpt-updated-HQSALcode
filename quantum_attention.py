@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from quantum_layer import QuantumFeatureExtractor
 
@@ -13,7 +14,8 @@ class HybridQuantumAttention(nn.Module):
     """
     def __init__(self, embed_dim: int, num_heads: int, num_quantum_heads: int,
                  num_qubits: int, q_depth: int, use_noisy_simulator: bool = False,
-                 shots: int = 1024, depol_error: float = 0.01, dropout: float = 0.1):
+                 shots: int = 1024, depol_error: float = 0.01, use_gpu_simulator: bool = False,
+                 dropout: float = 0.1, entangler: str = "ring"):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         
@@ -37,20 +39,27 @@ class HybridQuantumAttention(nn.Module):
         # and back num_qubits -> d_head.
         self.q_extractors = nn.ModuleList()
         self.k_extractors = nn.ModuleList()
+        self.v_extractors = nn.ModuleList()
         self.q_in_projs = nn.ModuleList()
         self.q_out_projs = nn.ModuleList()
         self.k_in_projs = nn.ModuleList()
         self.k_out_projs = nn.ModuleList()
-        
+        self.v_in_projs = nn.ModuleList()
+        self.v_out_projs = nn.ModuleList()
+
+        self.quantum_head_scale = nn.Parameter(torch.full((num_quantum_heads,), 0.5))
+        self.quantum_output_scale = nn.Parameter(torch.full((num_quantum_heads,), 0.1))
         for h in range(num_quantum_heads):
-            # QNN layers for Query and Key
+            # QNN layers for Query, Key, and Value
             self.q_extractors.append(
                 QuantumFeatureExtractor(
                     num_qubits=num_qubits,
                     q_depth=q_depth,
                     use_noisy_simulator=use_noisy_simulator,
                     shots=shots,
-                    depol_error=depol_error
+                    depol_error=depol_error,
+                    use_gpu_simulator=use_gpu_simulator,
+                    entangler=entangler
                 )
             )
             self.k_extractors.append(
@@ -59,7 +68,20 @@ class HybridQuantumAttention(nn.Module):
                     q_depth=q_depth,
                     use_noisy_simulator=use_noisy_simulator,
                     shots=shots,
-                    depol_error=depol_error
+                    depol_error=depol_error,
+                    use_gpu_simulator=use_gpu_simulator,
+                    entangler=entangler
+                )
+            )
+            self.v_extractors.append(
+                QuantumFeatureExtractor(
+                    num_qubits=num_qubits,
+                    q_depth=q_depth,
+                    use_noisy_simulator=use_noisy_simulator,
+                    shots=shots,
+                    depol_error=depol_error,
+                    use_gpu_simulator=use_gpu_simulator,
+                    entangler=entangler
                 )
             )
             # Classical adapters
@@ -67,6 +89,8 @@ class HybridQuantumAttention(nn.Module):
             self.q_out_projs.append(nn.Linear(num_qubits, self.d_head, bias=False))
             self.k_in_projs.append(nn.Linear(self.d_head, num_qubits, bias=False))
             self.k_out_projs.append(nn.Linear(num_qubits, self.d_head, bias=False))
+            self.v_in_projs.append(nn.Linear(self.d_head, num_qubits, bias=False))
+            self.v_out_projs.append(nn.Linear(num_qubits, self.d_head, bias=False))
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> tuple:
         # x shape: [batch_size, seq_len, embed_dim]
@@ -94,44 +118,67 @@ class HybridQuantumAttention(nn.Module):
             k_h = k[:, h, :, :]  # [B, L, d_head]
             v_h = v[:, h, :, :]  # [B, L, d_head]
             
-            # --- Hybrid Setup: Head 0 = classical, Heads 1,2,3 = quantum ---
-            if h == 0:
+            # --- Hybrid Setup: quantum-enhanced heads are the first num_quantum_heads after head 0 ---
+            if h == 0 or h > self.num_quantum_heads:
                 # --- Classical Head Processing ---
                 q_h_prime = q_h
                 k_h_prime = k_h
+                v_h_prime = v_h
             else:
-                # --- Quantum Head Processing (h=1,2,3) ---
-                # Get quantum head index (0-based for our quantum modules: h-1)
+                # --- Quantum Head Processing ---
                 q_idx = h - 1
                 # A. Project d_head down to num_qubits classically
                 q_qiskit_in = self.q_in_projs[q_idx](q_h)  # [B, L, num_qubits]
                 k_qiskit_in = self.k_in_projs[q_idx](k_h)  # [B, L, num_qubits]
-                
+                v_qiskit_in = self.v_in_projs[q_idx](v_h)  # [B, L, num_qubits]
+
                 # B. Pass through Variational Quantum Circuits (QNN)
                 q_qiskit_out = self.q_extractors[q_idx](q_qiskit_in)  # [B, L, num_qubits]
                 k_qiskit_out = self.k_extractors[q_idx](k_qiskit_in)  # [B, L, num_qubits]
+                v_qiskit_out = self.v_extractors[q_idx](v_qiskit_in)  # [B, L, num_qubits]
+
+                # C. Project back to d_head classically and add a residual correction
+                quantum_scale = torch.sigmoid(self.quantum_head_scale[q_idx])
+                quantum_output_scale = torch.sigmoid(self.quantum_output_scale[q_idx])
+                q_quantum = self.q_out_projs[q_idx](q_qiskit_out)
+                k_quantum = self.k_out_projs[q_idx](k_qiskit_out)
+                v_quantum = self.v_out_projs[q_idx](v_qiskit_out)
+                q_h_prime = q_h + quantum_output_scale * quantum_scale * q_quantum  # [B, L, d_head]
+                k_h_prime = k_h + quantum_output_scale * quantum_scale * k_quantum  # [B, L, d_head]
+                v_h_prime = v_h + quantum_output_scale * quantum_scale * v_quantum  # [B, L, d_head]
                 
-                # C. Project back to d_head classically
-                q_h_prime = self.q_out_projs[q_idx](q_qiskit_out)  # [B, L, d_head]
-                k_h_prime = self.k_out_projs[q_idx](k_qiskit_out)  # [B, L, d_head]
+            # D. Compute attention output using PyTorch's fused attention when available
+            if hasattr(F, "scaled_dot_product_attention"):
+                out_h = F.scaled_dot_product_attention(
+                    q_h_prime,
+                    k_h_prime,
+                    v_h_prime,
+                    attn_mask=mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False
+                )
+                scores = torch.matmul(q_h_prime, k_h_prime.transpose(-2, -1)) / math.sqrt(self.d_head)
+                if mask is not None:
+                    scores = scores + mask
+                weights = torch.softmax(scores, dim=-1)
+            else:
+                # D. Compute scaled dot-product attention scores
+                scores = torch.matmul(q_h_prime, k_h_prime.transpose(-2, -1)) / math.sqrt(self.d_head)
                 
-            # D. Compute scaled dot-product attention scores
-            # scores shape: [B, L, L]
-            scores = torch.matmul(q_h_prime, k_h_prime.transpose(-2, -1)) / math.sqrt(self.d_head)
-            
-            # E. Apply causal mask if provided
-            if mask is not None:
-                # Add mask (mask has 0 for allowed, -inf for masked out)
-                scores = scores + mask
+                # E. Apply causal mask if provided
+                if mask is not None:
+                    # Add mask (mask has 0 for allowed, -inf for masked out)
+                    scores = scores + mask
                 
-            # F. Softmax to obtain attention weights
-            weights = torch.softmax(scores, dim=-1)
-            weights = self.dropout(weights)
+                # F. Softmax to obtain attention weights
+                weights = torch.softmax(scores, dim=-1)
+                weights = self.dropout(weights)
+                
+                # G. Weighted sum of values
+                # out_h shape: [B, L, d_head]
+                out_h = torch.matmul(weights, v_h_prime)
+
             attn_weights_list.append(weights.unsqueeze(1)) # Keep track of head weight [B, 1, L, L]
-            
-            # G. Weighted sum of values
-            # out_h shape: [B, L, d_head]
-            out_h = torch.matmul(weights, v_h)
             head_outputs.append(out_h)
             
         # 4. Concatenate heads back: [B, L, D]

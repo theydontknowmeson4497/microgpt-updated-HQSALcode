@@ -190,9 +190,13 @@ class QuantumGPT(nn.Module):
             self.vqcs[vqc_idx] = TorchConnector(qnn, initial_weights=old_weights)
 
     def forward(self, token_id, pos_id, keys_cache, values_cache, q_keys_caches):
+        # Capture the compute device once (GPU if CUDA available, else CPU).
+        # Qiskit VQCs only run on CPU; we bridge back to `compute_device` after each call.
+        compute_device = token_id.device
+
         # Embeddings
         tok_emb = self.wte(token_id).squeeze(0)
-        pos_emb = self.wpe(torch.tensor([pos_id], device=token_id.device)).squeeze(0)
+        pos_emb = self.wpe(torch.tensor([pos_id], device=compute_device)).squeeze(0)
         x = tok_emb + pos_emb
         x = self.rmsnorm1(x)
         
@@ -217,25 +221,25 @@ class QuantumGPT(nn.Module):
             v_h = values_cache[0][:, hs : hs+self.head_dim]
             
             if h == 0:
-                # --- Classical Head ---
+                # --- Classical Head (fully on GPU) ---
                 k_h_cache = keys_cache[0][:, hs : hs+self.head_dim]
                 attn_logits = torch.matmul(q_h.unsqueeze(0), k_h_cache.transpose(0, 1)).squeeze(0) / math.sqrt(self.head_dim)
                 attn_weights = torch.softmax(attn_logits, dim=-1)
                 head_out = torch.matmul(attn_weights.unsqueeze(0), v_h).squeeze(0)
             else:
-                # --- Quantum Head ---
+                # --- Quantum Head (VQC runs on CPU; bridge in/out) ---
                 q_idx = h - 1
                 
-                # 1. Project Query, scale, and pass through VQC
+                # 1. Project Query, scale, move to CPU, run VQC, move back to compute_device
                 q_h_proj = self.q_in_projs[q_idx](q_h.unsqueeze(0))
                 q_h_scaled = torch.tanh(q_h_proj) * torch.pi
-                q_h_vqc = self.vqcs[q_idx](q_h_scaled)
+                q_h_vqc = self.vqcs[q_idx](q_h_scaled.cpu()).to(compute_device)
                 q_h_prime = self.q_out_projs[q_idx](q_h_vqc).squeeze(0)
                 
-                # 2. Project Key, scale, and pass through VQC
+                # 2. Project Key, scale, move to CPU, run VQC, move back to compute_device
                 k_h_proj = self.k_in_projs[q_idx](k_h.unsqueeze(0))
                 k_h_scaled = torch.tanh(k_h_proj) * torch.pi
-                k_h_vqc = self.vqcs[q_idx](k_h_scaled)
+                k_h_vqc = self.vqcs[q_idx](k_h_scaled.cpu()).to(compute_device)
                 k_h_prime = self.k_out_projs[q_idx](k_h_vqc)
                 
                 # 3. Update quantum key cache for this head
@@ -287,6 +291,15 @@ def train_and_evaluate(use_noisy_eval=False, num_steps=1000):
 
     # 3. Model instantiation
     model = QuantumGPT(vocab_size=vocab_size, use_noisy=False)
+
+    # Move all classical PyTorch parameters (embeddings, projections, MLP, LM head)
+    # to GPU. TorchConnector weights are registered as nn.Parameters but the VQC
+    # execution always runs on CPU — the device bridge in forward() handles that.
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        print(f"[Device] Using GPU: {props.name} ({props.total_memory / 1024**3:.1f} GB VRAM)")
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -307,18 +320,18 @@ def train_and_evaluate(use_noisy_eval=False, num_steps=1000):
         tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
         n = min(model.block_size, len(tokens) - 1)
 
-        # Initialize KV Cache and QUANTUM KEY CACHES
-        keys_cache = [torch.zeros(0, model.n_embd)]
-        values_cache = [torch.zeros(0, model.n_embd)]
-        q_keys_caches = [torch.zeros(0, model.head_dim) for _ in range(model.num_quantum_heads)]
+        # Initialize KV Cache and QUANTUM KEY CACHES on the compute device
+        keys_cache = [torch.zeros(0, model.n_embd, device=device)]
+        values_cache = [torch.zeros(0, model.n_embd, device=device)]
+        q_keys_caches = [torch.zeros(0, model.head_dim, device=device) for _ in range(model.num_quantum_heads)]
         
         optimizer.zero_grad()
         
         losses = []
         for pos_id in range(n):
             token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-            token_tensor = torch.tensor([token_id], dtype=torch.long)
-            target_tensor = torch.tensor([target_id], dtype=torch.long)
+            token_tensor = torch.tensor([token_id], dtype=torch.long, device=device)
+            target_tensor = torch.tensor([target_id], dtype=torch.long, device=device)
             
             logits = model(token_tensor, pos_id, keys_cache, values_cache, q_keys_caches)
             loss_t = criterion(logits.unsqueeze(0), target_tensor)
@@ -358,15 +371,15 @@ def train_and_evaluate(use_noisy_eval=False, num_steps=1000):
                 tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
                 n = min(model.block_size, len(tokens) - 1)
                 
-                keys_cache = [torch.zeros(0, model.n_embd)]
-                values_cache = [torch.zeros(0, model.n_embd)]
-                q_keys_caches = [torch.zeros(0, model.head_dim) for _ in range(model.num_quantum_heads)]
+                keys_cache = [torch.zeros(0, model.n_embd, device=device)]
+                values_cache = [torch.zeros(0, model.n_embd, device=device)]
+                q_keys_caches = [torch.zeros(0, model.head_dim, device=device) for _ in range(model.num_quantum_heads)]
                 
                 losses = []
                 for pos_id in range(n):
                     token_id, target_id = tokens[pos_id], tokens[pos_id + 1]
-                    token_tensor = torch.tensor([token_id], dtype=torch.long)
-                    target_tensor = torch.tensor([target_id], dtype=torch.long)
+                    token_tensor = torch.tensor([token_id], dtype=torch.long, device=device)
+                    target_tensor = torch.tensor([target_id], dtype=torch.long, device=device)
                     
                     logits = model(token_tensor, pos_id, keys_cache, values_cache, q_keys_caches)
                     loss_t = criterion(logits.unsqueeze(0), target_tensor)
@@ -385,13 +398,13 @@ def train_and_evaluate(use_noisy_eval=False, num_steps=1000):
     model.eval()
     with torch.no_grad():
         for sample_idx in range(5):
-            keys_cache = [torch.zeros(0, model.n_embd)]
-            values_cache = [torch.zeros(0, model.n_embd)]
-            q_keys_caches = [torch.zeros(0, model.head_dim) for _ in range(model.num_quantum_heads)]
+            keys_cache = [torch.zeros(0, model.n_embd, device=device)]
+            values_cache = [torch.zeros(0, model.n_embd, device=device)]
+            q_keys_caches = [torch.zeros(0, model.head_dim, device=device) for _ in range(model.num_quantum_heads)]
             token_id = BOS
             sample = []
             for pos_id in range(model.block_size):
-                token_tensor = torch.tensor([token_id], dtype=torch.long)
+                token_tensor = torch.tensor([token_id], dtype=torch.long, device=device)
                 logits = model(token_tensor, pos_id, keys_cache, values_cache, q_keys_caches)
                 probs = torch.softmax(logits / temperature, dim=-1)
                 token_id = torch.multinomial(probs, num_samples=1).item()

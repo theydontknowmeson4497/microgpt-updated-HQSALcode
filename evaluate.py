@@ -1,11 +1,56 @@
 import torch
 from config import Hyperparameters as hp
-from utils import set_seed, count_parameters, Timer
+from utils import set_seed, count_parameters, Timer, get_device
 from data import get_dataloaders
 from model import HybridQuantumTransformerDecoder
 from classical_baseline import ClassicalTransformerDecoder
 from train import train_model, evaluate_model
 import time
+
+
+def build_optimizer_and_scheduler(model: torch.nn.Module):
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=hp.learning_rate, weight_decay=hp.weight_decay
+    )
+    # Use cosine annealing for smoother long-run convergence
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=hp.epochs,
+        eta_min=hp.min_lr
+    )
+    return optimizer, scheduler
+
+
+def print_summary(results: dict):
+    print("\n" + "=" * 80)
+    print("                         ABLATION STUDY SUMMARY REPORT")
+    print("=" * 80)
+    print(f"{'Model Configuration':<32} | {'Params':<10} | {'Train Loss':<10} | {'Val Loss':<8} | {'Val Perp':<8} | {'Time (s)':<8}")
+    print("-" * 80)
+
+    best_model = None
+    best_val_loss = float('inf')
+
+    for name, data in results.items():
+        hist = data["history"]
+        final_train_loss = hist["train_loss"][-1] if hist["train_loss"] else float('nan')
+        final_val_loss = hist["val_loss"][-1] if hist["val_loss"] else float('nan')
+        final_val_perp = hist["val_perplexity"][-1] if hist["val_perplexity"] else float('nan')
+        total_time = data["time"]
+        params = data["params"]
+
+        if final_val_loss < best_val_loss:
+            best_val_loss = final_val_loss
+            best_model = name
+
+        print(f"{name:<32} | {params:<10} | {final_train_loss:<10.4f} | {final_val_loss:<8.4f} | {final_val_perp:<8.2f} | {total_time:<8.1f}")
+
+    print("=" * 80)
+    if best_model is not None:
+        print(f"Best validation result: {best_model} with val loss {best_val_loss:.4f}")
+    print("Note: Noisy hybrid evaluation is performed only in inference mode using the trained noise-free weights.")
+    print("=" * 80)
+
 
 def run_ablation_study():
     print("=" * 60)
@@ -14,11 +59,11 @@ def run_ablation_study():
     
     # 1. Setup reproducibility and device
     set_seed(hp.seed)
-    device = torch.device(hp.device)
+    device = get_device()          # prints GPU name or CPU fallback message
     print(f"Running on device: {device}")
     
     # 2. Get dataloaders
-    print("Generating synthetic language modeling dataset...")
+    print("Loading Tiny Shakespeare language modeling dataset...")
     train_loader, val_loader = get_dataloaders(
         num_samples=hp.num_samples,
         val_samples=hp.val_samples,
@@ -27,8 +72,8 @@ def run_ablation_study():
         batch_size=hp.batch_size,
         seed=hp.seed
     )
-    print(f"Train samples: {hp.num_samples} | Val samples: {hp.val_samples}")
-    print(f"Sequence length: {hp.seq_len} | Vocab size: {hp.vocab_size}")
+    print(f"Train samples: {len(train_loader.dataset)} | Val samples: {len(val_loader.dataset)}")
+    print(f"Sequence length: {hp.seq_len} | Vocabulary size: {hp.vocab_size}")
     
     results = {}
     
@@ -49,23 +94,28 @@ def run_ablation_study():
         num_layers=hp.num_layers,
         dropout=hp.dropout
     ).to(device)
-    
+
+    # Do not use torch.compile in this environment because it may require
+    # Triton backend modules that are not available or fully functional.
+    # The model still uses AMP and GPU-optimized cuDNN settings for speed.
     params_classical = count_parameters(classical_model)
     print(f"Classical Model Parameter Count: {params_classical}")
-    
-    optimizer = torch.optim.AdamW(classical_model.parameters(), lr=hp.learning_rate)
-    
+    optimizer, scheduler = build_optimizer_and_scheduler(classical_model)
+
     with Timer() as t:
         classical_history = train_model(
             model=classical_model,
             train_loader=train_loader,
             val_loader=val_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             epochs=hp.epochs,
-            device=hp.device
+            device=device,
+            patience=hp.patience,
+            min_lr=hp.min_lr
         )
     classical_time = t.elapsed
-    
+
     results["Classical Baseline"] = {
         "params": params_classical,
         "history": classical_history,
@@ -91,13 +141,15 @@ def run_ablation_study():
         ffn_dim=hp.ffn_dim,
         num_layers=hp.num_layers,
         use_noisy_simulator=False,
-        dropout=hp.dropout
+        use_gpu_simulator=(device.type == "cuda"),
+        dropout=hp.dropout,
+        entangler=hp.entangler
     ).to(device)
     
     params_q_clean = count_parameters(quantum_model_clean)
     print(f"Hybrid Model Parameter Count: {params_q_clean}")
     
-    optimizer = torch.optim.AdamW(quantum_model_clean.parameters(), lr=hp.learning_rate)
+    optimizer, scheduler = build_optimizer_and_scheduler(quantum_model_clean)
     
     with Timer() as t:
         q_clean_history = train_model(
@@ -105,8 +157,11 @@ def run_ablation_study():
             train_loader=train_loader,
             val_loader=val_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             epochs=hp.epochs,
-            device=hp.device
+            device=device,
+            patience=hp.patience,
+            min_lr=hp.min_lr
         )
     q_clean_time = t.elapsed
     
@@ -135,9 +190,11 @@ def run_ablation_study():
         ffn_dim=hp.ffn_dim,
         num_layers=hp.num_layers,
         use_noisy_simulator=True,
+        use_gpu_simulator=(device.type == "cuda"),
         shots=hp.shots,
         depol_error=hp.depolarizing_error,
-        dropout=hp.dropout
+        dropout=hp.dropout,
+        entangler=hp.entangler
     ).to(device)
     
     # Load the weights from the trained noise-free model
@@ -165,27 +222,7 @@ def run_ablation_study():
         "time": q_noisy_time
     }
     
-    # ==========================================
-    # Print Ablation Summary Table
-    # ==========================================
-    print("\n" + "=" * 80)
-    print("                         ABLATION STUDY SUMMARY REPORT")
-    print("=" * 80)
-    print(f"{'Model Configuration':<32} | {'Params':<8} | {'Train Loss':<10} | {'Val Loss':<8} | {'Val Perp':<8} | {'Time (s)':<8}")
-    print("-" * 80)
-    
-    for name, data in results.items():
-        hist = data["history"]
-        final_train_loss = hist["train_loss"][-1]
-        final_val_loss = hist["val_loss"][-1]
-        final_val_perp = hist["val_perplexity"][-1]
-        total_time = data["time"]
-        params = data["params"]
-        
-        print(f"{name:<32} | {params:<8} | {final_train_loss:<10.4f} | {final_val_loss:<8.4f} | {final_val_perp:<8.2f} | {total_time:<8.1f}")
-    print("=" * 80)
-    print("Note on Memory: Simulation runs locally in RAM. Low memory footprint (<200MB) due to small models.")
-    print("=" * 80)
+    print_summary(results)
 
 if __name__ == "__main__":
     run_ablation_study()

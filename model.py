@@ -27,7 +27,8 @@ class HybridQuantumTransformerDecoderLayer(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, num_quantum_heads: int,
                  num_qubits: int, q_depth: int, ffn_dim: int, 
                  use_noisy_simulator: bool = False, shots: int = 1024, 
-                 depol_error: float = 0.01, dropout: float = 0.1):
+                 depol_error: float = 0.01, use_gpu_simulator: bool = False,
+                 dropout: float = 0.1, entangler: str = "ring"):
         super().__init__()
         
         self.norm1 = nn.LayerNorm(embed_dim)
@@ -40,7 +41,9 @@ class HybridQuantumTransformerDecoderLayer(nn.Module):
             use_noisy_simulator=use_noisy_simulator,
             shots=shots,
             depol_error=depol_error,
-            dropout=dropout
+            use_gpu_simulator=use_gpu_simulator,
+            dropout=dropout,
+            entangler=entangler
         )
         self.dropout1 = nn.Dropout(dropout)
         
@@ -68,7 +71,8 @@ class HybridQuantumTransformerDecoder(nn.Module):
     def __init__(self, vocab_size: int, embed_dim: int, seq_len: int, num_heads: int,
                  num_quantum_heads: int, num_qubits: int, q_depth: int, ffn_dim: int,
                  num_layers: int = 1, use_noisy_simulator: bool = False,
-                 shots: int = 1024, depol_error: float = 0.01, dropout: float = 0.1):
+                 shots: int = 1024, depol_error: float = 0.01, use_gpu_simulator: bool = False,
+                 dropout: float = 0.1, entangler: str = "ring"):
         super().__init__()
         
         self.seq_len = seq_len
@@ -88,7 +92,9 @@ class HybridQuantumTransformerDecoder(nn.Module):
                 use_noisy_simulator=use_noisy_simulator,
                 shots=shots,
                 depol_error=depol_error,
-                dropout=dropout
+                use_gpu_simulator=use_gpu_simulator,
+                dropout=dropout,
+                entangler=entangler
             ) for _ in range(num_layers)
         ])
         
