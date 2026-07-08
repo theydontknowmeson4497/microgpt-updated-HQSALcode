@@ -99,6 +99,8 @@ class QuantumFeatureExtractor(nn.Module):
         # Get estimator primitive
         self.estimator = get_estimator(use_noisy_simulator, shots, depol_error)
         
+        self.quantum_device = torch.device("cpu")
+
         # Create Qiskit QNN
         self.qnn = EstimatorQNN(
             circuit=self.qc,
@@ -113,6 +115,13 @@ class QuantumFeatureExtractor(nn.Module):
         # Initial weights can be random or small uniform values
         initial_weights = torch.randn(self.qnn.num_weights) * 0.1
         self.qnn_layer = TorchConnector(self.qnn, initial_weights=initial_weights)
+        self.qnn_layer.to(self.quantum_device)
+
+    def to(self, *args, **kwargs):
+        module = super().to(*args, **kwargs)
+        if hasattr(module, "qnn_layer"):
+            module.qnn_layer.to(torch.device("cpu"))
+        return module
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: [batch_size, seq_len, num_qubits]
@@ -127,8 +136,10 @@ class QuantumFeatureExtractor(nn.Module):
         # Using tanh projection to bound the raw classical values gracefully
         x_scaled = torch.tanh(x_flat) * torch.pi
         
-        # Run QNN forward pass
-        out_flat = self.qnn_layer(x_scaled)
+        # Run QNN forward pass on CPU while keeping the surrounding PyTorch path on GPU
+        x_scaled_cpu = x_scaled.to(self.quantum_device)
+        out_flat_cpu = self.qnn_layer(x_scaled_cpu)
+        out_flat = out_flat_cpu.to(x.device)
         
         # Restore shape to [batch_size, seq_len, num_qubits]
         out = out_flat.view(batch_size, seq_len, self.num_qubits)
