@@ -94,23 +94,26 @@ class HybridQuantumAttention(nn.Module):
             k_h = k[:, h, :, :]  # [B, L, d_head]
             v_h = v[:, h, :, :]  # [B, L, d_head]
             
-            if h < self.num_quantum_heads:
-                # --- Quantum Head Processing ---
-                # A. Project d_head down to num_qubits classically
-                q_qiskit_in = self.q_in_projs[h](q_h)  # [B, L, num_qubits]
-                k_qiskit_in = self.k_in_projs[h](k_h)  # [B, L, num_qubits]
-                
-                # B. Pass through Variational Quantum Circuits (QNN)
-                q_qiskit_out = self.q_extractors[h](q_qiskit_in)  # [B, L, num_qubits]
-                k_qiskit_out = self.k_extractors[h](k_qiskit_in)  # [B, L, num_qubits]
-                
-                # C. Project back to d_head classically
-                q_h_prime = self.q_out_projs[h](q_qiskit_out)  # [B, L, d_head]
-                k_h_prime = self.k_out_projs[h](k_qiskit_out)  # [B, L, d_head]
-            else:
+            # --- Hybrid Setup: Head 0 = classical, Heads 1,2,3 = quantum ---
+            if h == 0:
                 # --- Classical Head Processing ---
                 q_h_prime = q_h
                 k_h_prime = k_h
+            else:
+                # --- Quantum Head Processing (h=1,2,3) ---
+                # Get quantum head index (0-based for our quantum modules: h-1)
+                q_idx = h - 1
+                # A. Project d_head down to num_qubits classically
+                q_qiskit_in = self.q_in_projs[q_idx](q_h)  # [B, L, num_qubits]
+                k_qiskit_in = self.k_in_projs[q_idx](k_h)  # [B, L, num_qubits]
+                
+                # B. Pass through Variational Quantum Circuits (QNN)
+                q_qiskit_out = self.q_extractors[q_idx](q_qiskit_in)  # [B, L, num_qubits]
+                k_qiskit_out = self.k_extractors[q_idx](k_qiskit_in)  # [B, L, num_qubits]
+                
+                # C. Project back to d_head classically
+                q_h_prime = self.q_out_projs[q_idx](q_qiskit_out)  # [B, L, d_head]
+                k_h_prime = self.k_out_projs[q_idx](k_qiskit_out)  # [B, L, d_head]
                 
             # D. Compute scaled dot-product attention scores
             # scores shape: [B, L, L]

@@ -9,13 +9,14 @@ import os
 import math
 import random
 import time
+from config import Hyperparameters as hp
 
 def train_and_evaluate(num_steps=1000):
     print("=" * 60)
     print("STARTING CLASSICAL MICROGPT TRAINING")
     print("=" * 60)
     
-    random.seed(42) # Set seed for reproducibility
+    random.seed(hp.seed) # Set seed for reproducibility
     
     # 1. Dataset loading
     if not os.path.exists('input.txt'):
@@ -23,14 +24,24 @@ def train_and_evaluate(num_steps=1000):
         names_url = 'https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'
         urllib.request.urlretrieve(names_url, 'input.txt')
     docs = [line.strip() for line in open('input.txt') if line.strip()]
-    random.shuffle(docs)
     print(f"num docs: {len(docs)}")
 
-    # 2. Tokenizer setup
-    uchars = sorted(set(''.join(docs)))
-    BOS = len(uchars)
-    vocab_size = len(uchars) + 1
-    print(f"vocab size: {vocab_size}")
+    # 2. Word-level tokenizer setup
+    # Each unique word (name) is its own token. BOS is the boundary token.
+    unique_words = sorted(set(docs))
+    word_to_idx = {w: i for i, w in enumerate(unique_words)}
+    BOS = len(unique_words)          # BOS/EOS token id
+    vocab_size = len(unique_words) + 1
+    print(f"vocab size (unique words + BOS): {vocab_size}")
+
+    # 3. Build flat token stream: BOS word0 BOS word1 BOS word2 ...
+    # Each word is preceded by a BOS so the model learns to predict next word given context
+    flat_tokens = []
+    for w in docs:
+        flat_tokens.append(BOS)
+        flat_tokens.append(word_to_idx[w])
+    flat_tokens.append(BOS)  # final boundary
+    print(f"total tokens in stream: {len(flat_tokens)}")
 
     # 3. Autograd Value Engine
     class Value:
@@ -65,23 +76,33 @@ def train_and_evaluate(num_steps=1000):
         def backward(self):
             topo = []
             visited = set()
-            def build_topo(v):
+            # Iterative post-order traversal — avoids recursion limit on large graphs
+            stack = [self]
+            in_progress = set()
+            while stack:
+                v = stack[-1]
                 if v not in visited:
-                    visited.add(v)
-                    for child in v._children:
-                        build_topo(child)
-                    topo.append(v)
-            build_topo(self)
+                    if v not in in_progress:
+                        in_progress.add(v)
+                        for child in v._children:
+                            if child not in visited:
+                                stack.append(child)
+                    else:
+                        visited.add(v)
+                        topo.append(v)
+                        stack.pop()
+                else:
+                    stack.pop()
             self.grad = 1
             for v in reversed(topo):
                 for child, local_grad in zip(v._children, v._local_grads):
                     child.grad += local_grad * v.grad
 
     # 4. Parameters and network dimensions
-    n_layer = 1
-    n_embd = 16
-    block_size = 16
-    n_head = 4
+    n_layer = hp.num_layers
+    n_embd = hp.embed_dim
+    block_size = hp.seq_len
+    n_head = hp.num_heads
     head_dim = n_embd // n_head
     
     matrix = lambda nout, nin, std=0.08: [[Value(random.gauss(0, std)) for _ in range(nin)] for _ in range(nout)]
@@ -91,12 +112,11 @@ def train_and_evaluate(num_steps=1000):
         state_dict[f'layer{i}.attn_wk'] = matrix(n_embd, n_embd)
         state_dict[f'layer{i}.attn_wv'] = matrix(n_embd, n_embd)
         state_dict[f'layer{i}.attn_wo'] = matrix(n_embd, n_embd)
-        state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
-        state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
+        state_dict[f'layer{i}.mlp_fc1'] = matrix(hp.ffn_dim, n_embd)
+        state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, hp.ffn_dim)
         
     params = [p for mat in state_dict.values() for row in mat for p in row]
     print(f"num params: {len(params)}")
-
     # 5. Model functions
     def linear(x, w):
         return [sum(wi * xi for wi, xi in zip(wo, x)) for wo in w]
@@ -119,7 +139,7 @@ def train_and_evaluate(num_steps=1000):
         x = rmsnorm(x)
 
         for li in range(n_layer):
-            # 1) Multi-head Attention block
+            # 1. Multi-head Attention block
             x_residual = x
             x = rmsnorm(x)
             q = linear(x, state_dict[f'layer{li}.attn_wq'])
@@ -140,7 +160,7 @@ def train_and_evaluate(num_steps=1000):
             x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
             x = [a + b for a, b in zip(x, x_residual)]
             
-            # 2) MLP block
+            # 2. MLP block
             x_residual = x
             x = rmsnorm(x)
             x = linear(x, state_dict[f'layer{li}.mlp_fc1'])
@@ -151,20 +171,21 @@ def train_and_evaluate(num_steps=1000):
         logits = linear(x, state_dict['lm_head'])
         return logits
 
-    # 6. Adam Optimizer Setup
-    learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
+    # 6. Optimizer Setup
+    learning_rate, beta1, beta2, eps_adam = hp.learning_rate, 0.85, 0.99, 1e-8
     m = [0.0] * len(params)
     v = [0.0] * len(params)
 
     # 7. Training Loop with Metrics
-    # num_steps parameter passed to function
+    # Cap steps to max_train_steps to stay within 16 GB RAM on the scalar autograd engine
+    num_steps = min(len(docs), hp.max_train_steps)
     all_step_losses = []
     
     start_time = time.perf_counter()
     
     for step in range(num_steps):
-        doc = docs[step % len(docs)]
-        tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
+        doc = docs[step]
+        tokens = [BOS, word_to_idx[doc], BOS]   # BOS <word> BOS
         n = min(block_size, len(tokens) - 1)
 
         keys, values = [[] for _ in range(n_layer)], [[] for _ in range(n_layer)]
@@ -199,7 +220,7 @@ def train_and_evaluate(num_steps=1000):
     training_time = time.perf_counter() - start_time
     print(f"Finished training in {training_time:.2f} seconds.")
 
-    # 8. Inference (Babbles back to us)
+    # 8. Inference — generates a sequence of words
     temperature = 0.5
     print("\n--- Generating samples ---")
     inference_samples = []
@@ -213,10 +234,10 @@ def train_and_evaluate(num_steps=1000):
             token_id = random.choices(range(vocab_size), weights=[p.data for p in probs])[0]
             if token_id == BOS:
                 break
-            sample.append(uchars[token_id])
-        generated_name = "".join(sample)
-        inference_samples.append(generated_name)
-        print(f"  sample {sample_idx+1}: {generated_name}")
+            sample.append(unique_words[token_id])
+        generated = " ".join(sample)
+        inference_samples.append(generated)
+        print(f"  sample {sample_idx+1}: {generated}")
         
     return {
         "total_params": len(params),
