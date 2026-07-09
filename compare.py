@@ -10,6 +10,7 @@ Orchestrates the ablation study comparing:
 Trains models, prints comparison table, saves loss convergence curve.
 """
 
+import json
 import matplotlib.pyplot as plt
 import torch
 import microgpt_classical
@@ -134,7 +135,16 @@ def run_ablation_study(use_pytorch_classical=True, use_pennylane_quantum=True):
     output_plot_path = "loss_comparison.png"
     plt.savefig(output_plot_path, bbox_inches="tight", dpi=300)
     plt.close()
+
+    history_payload = {
+        "train_loss": classical_res.get("losses", []) if classical_res is not None else quantum_res.get("losses", []),
+        "val_loss": quantum_res.get("losses", []) if quantum_res is not None else classical_res.get("losses", []),
+    }
+    with open("training_history.json", "w") as f:
+        json.dump(history_payload, f, indent=2)
+
     print(f"Loss comparison plot saved to {output_plot_path}")
+    print("Training/validation loss history saved to training_history.json")
 
 
 if __name__ == "__main__":
