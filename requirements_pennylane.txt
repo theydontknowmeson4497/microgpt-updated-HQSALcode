@@ -1,0 +1,12 @@
+# PennyLane requirements for GPU-accelerated quantum simulation
+pennylane>=0.36.0
+pennylane-lightning>=0.36.0
+# For NVIDIA GPU support (lightning.gpu) - install if you have CUDA
+# pennylane-lightning-gpu>=0.36.0
+# You can also install via pip install pennylane-lightning[gpu]
+
+# Original project requirements are still needed:
+# torch>=2.0
+# matplotlib>=3.0
+# qiskit>=1.0 (optional, for original Qiskit model)
+

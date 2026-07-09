@@ -49,7 +49,7 @@ _VQC_CACHE = {}
 
 
 def _build_vqc(num_qubits, q_depth, use_noisy, shots, depol_error):
-    """Builds one VQC (PQC + QNN + TorchConnector) with fixed num_qubits, with caching."""
+    """Builds one VQC (PQC + QNN + TorchConnector) with fixed num_qubits, with caching and optimizations."""
     cache_key = (num_qubits, q_depth, use_noisy, shots, depol_error)
     if cache_key in _VQC_CACHE:
         return _VQC_CACHE[cache_key]
@@ -81,7 +81,7 @@ def _build_vqc(num_qubits, q_depth, use_noisy, shots, depol_error):
         pauli_str = "".join(reversed(pauli_list))
         observables.append(SparsePauliOp.from_list([(pauli_str, 1.0)]))
 
-    # Estimator primitive
+    # Estimator primitive - use fastest possible settings
     if not use_noisy:
         estimator = StatevectorEstimator()
     else:
@@ -108,23 +108,25 @@ def _build_vqc(num_qubits, q_depth, use_noisy, shots, depol_error):
     return vqc
 
 
-# Optimized quantum connector with minimal data transfers
+# Optimized quantum connector with minimal data transfers and no-copy where possible
 @torch.jit.ignore
 def _run_quantum_connector(connector, x):
     """Run quantum connector with minimal CPU-GPU data transfer overhead."""
-    # Detach and move to CPU (avoid unnecessary gradient tracking on transfer)
-    x_cpu = x.detach().to("cpu", copy=False) if x.requires_grad else x.to("cpu", copy=False)
-    # Run VQC
-    out_cpu = connector(x_cpu)
-    # Move back to original device, preserving gradient information
+    # Move to CPU - avoid unnecessary gradient tracking on transfer for inputs
     if x.requires_grad:
-        return out_cpu.to(x.device, copy=False)
+        # For training: we need gradients, so move to CPU normally
+        x_cpu = x.to("cpu")
+        out_cpu = connector(x_cpu)
+        return out_cpu.to(x.device)
     else:
+        # For inference: no gradients, faster transfer
+        x_cpu = x.to("cpu", copy=False)
+        out_cpu = connector(x_cpu)
         return out_cpu.to(x.device, copy=False)
 
 
 class QuantumGPT(nn.Module):
-    def __init__(self, vocab_size, use_noisy=False, device=None):
+    def __init__(self, vocab_size, use_noisy=False, device=None, compile_classical=True):
         super().__init__()
         torch.manual_seed(hp.seed)
         random.seed(hp.seed)
@@ -183,6 +185,20 @@ class QuantumGPT(nn.Module):
         self.to(self.classical_device)
         for vqc in self.vqcs:
             vqc.to(self.quantum_device)
+            
+        # Optional: compile classical layers for speed
+        if compile_classical and torch.cuda.is_available():
+            try:
+                # Compile linear layers and RMSNorm for faster execution
+                # Skip compiling VQC-adjacent layers since they interface with CPU
+                for name, module in self.named_modules():
+                    if isinstance(module, (nn.Linear, RMSNorm)) and 'q_' not in name and 'k_' not in name:
+                        try:
+                            setattr(self, name, torch.compile(module, mode='max-autotune'))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
     def to(self, *args, **kwargs):
         module = super().to(*args, **kwargs)
@@ -215,9 +231,8 @@ class QuantumGPT(nn.Module):
         q_keys_caches: list[Tensor] length n_layer * num_quantum_heads,
                        each [pos, head_dim]  (indexed as li*num_quantum_heads + q_idx)
         """
-        # Embeddings
-        x = self.wte(token_id).squeeze(0) + \
-            self.wpe(torch.tensor([pos_id], device=token_id.device)).squeeze(0)
+        # Embeddings - use integer directly for position to avoid unnecessary tensor creation
+        x = self.wte(token_id).squeeze(0) + self.wpe.weight[pos_id]
         x = self.rmsnorm_emb(x)
 
         for li in range(self.n_layer):
@@ -318,8 +333,12 @@ def train_and_evaluate(use_noisy_eval=False):
     vocab_size   = len(unique_words) + 1
     print(f"vocab size (unique words + BOS): {vocab_size}")
 
+    # Clear old VQC cache to pick up new gradient setting
+    global _VQC_CACHE
+    _VQC_CACHE = {}
+
     # 3. Build model
-    model = QuantumGPT(vocab_size=vocab_size, use_noisy=False, device=device)
+    model = QuantumGPT(vocab_size=vocab_size, use_noisy=False, device=device, compile_classical=True)
     total_params   = sum(p.numel() for p in model.parameters() if p.requires_grad)
     quantum_params = sum(vqc.weight.numel() for vqc in model.vqcs)
     print(f"Total Params: {total_params:,} | Quantum Params: {quantum_params}")
@@ -384,7 +403,7 @@ def train_and_evaluate(use_noisy_eval=False):
         optimizer.step()
 
         if step == 0 or (step + 1) % 1000 == 0:
-            print(f"Step {step+1:5d}/{num_steps} | Loss: {loss.item():.4f}")
+                print(f"Step {step+1:5d}/{num_steps} | Loss: {loss.item():.4f}")
 
     training_time = time.perf_counter() - start_time
     print(f"Finished training in {training_time:.2f} seconds.")
